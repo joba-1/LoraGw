@@ -17,6 +17,7 @@
 #include <WiFiUdp.h>
 
 // Lora
+#include <SPI.h>
 #include <rfm95.h>
 
 #define ARRAY_SIZE(a) (sizeof(a) / sizeof(*(a)))
@@ -62,22 +63,29 @@ typedef struct payload {
   uint16_t mVcc;
   uint16_t mVbat;
   uint16_t mVaccu;
-  uint32_t check;
+  uint16_t check;
 } payload_t;
 
-payload_t payload = {0};              // last received payload
+payload_t payload = {0}; // last received payload
+time_t payload_received;
 signal_t signal = {0};                // last received signal quality
-uint32_t last_counter_reset = 0;      // millis() of last counter reset
+uint32_t last_message = 0;            // millis() of last counter reset
 volatile uint32_t counter_events = 0; // events of current interval so far
+rfm95_t rfm95_dev;
 
 ICACHE_RAM_ATTR void event() { counter_events++; }
+
+// checksum for payload
+uint32 checksum(payload_t *p) {
+  return p->magic + p->mVaccu + p->mVbat + p->mVcc;
+}
 
 // Post data to InfluxDB
 void post_data() {
   static const char uri[] = "/write?db=" INFLUX_DB "&precision=s";
 
-  char fmt[] =
-      "payload,dev=" HOSTNAME ",ver=%s vcc=%.3f,vbat=%.3f,vaccu=%.3f,snr=%d,rssi=%d\n";
+  char fmt[] = "payload,dev=" HOSTNAME
+               ",ver=%s vcc=%.3f,vbat=%.3f,vaccu=%.3f,snr=%d,rssi=%d\n";
   char msg[sizeof(fmt) + 20 + 3 * 10];
   snprintf(msg, sizeof(msg), fmt, VERSION, payload.mVcc / 1000.0,
            payload.mVbat / 1000.0, payload.mVaccu / 1000.0, signal.snr,
@@ -112,9 +120,9 @@ void setup_webserver() {
                               "  \"measured\": \"%s\"\n"
                               " },\n"
                               " \"voltage\": {\n"
-                              "  \"vcc\": %u,\n"
-                              "  \"vbat\": %u,\n"
-                              "  \"vaccu\": %u\n"
+                              "  \"vcc\": %.3f,\n"
+                              "  \"vbat\": %.3f,\n"
+                              "  \"vaccu\": %.3f\n"
                               " },\n"
                               " \"signal\": {\n"
                               "  \"snr\": %u,\n"
@@ -124,9 +132,10 @@ void setup_webserver() {
     static char msg[sizeof(fmt) + 2 * 20 + 5 * 10];
     static char iso_time[30];
     strftime(iso_time, sizeof(iso_time), "%FT%T%Z",
-             localtime(&events.measured));
-    snprintf(msg, sizeof(msg), fmt, start_time, iso_time, payload.vcc,
-             payload.vbat, payload.vacu, signal.snr, signal.rssi);
+             localtime(&payload_received));
+    snprintf(msg, sizeof(msg), fmt, start_time, iso_time, payload.mVcc / 1000.0,
+             payload.mVbat / 1000.0, payload.mVaccu / 1000.0, signal.snr,
+             signal.rssi);
     web_server.send(200, "application/json", msg);
   });
 
@@ -156,7 +165,8 @@ void setup_webserver() {
       "  <h1>" PROGNAME " v" VERSION "</h1>\n"
       "  <table><tr>\n"
       "   <td><form action=\"payload\">\n"
-      "    <input type=\"submit\" name=\"payload\" value=\"Payload as JSON\" />\n"
+      "    <input type=\"submit\" name=\"payload\" value=\"Payload as JSON\" "
+      "/>\n"
       "   </form></td>\n"
       "   <td><form action=\"reset\" method=\"post\">\n"
       "    <input type=\"submit\" name=\"reset\" value=\"Reset\" />\n"
@@ -184,6 +194,37 @@ void setup_webserver() {
 
   MDNS.addService("http", "tcp", WEBSERVER_PORT);
   syslog.logf(LOG_NOTICE, "Serving HTTP on port %d", WEBSERVER_PORT);
+}
+
+int8_t duplexSpi(uint8_t dev, uint8_t addr, uint8_t *data, uint16_t len) {
+  digitalWrite(NSS_PIN, LOW);
+  SPI.transfer(addr);
+  SPI.transfer(data, len);
+  digitalWrite(NSS_PIN, HIGH);
+  return 0;
+}
+
+uint8_t readPin(uint8_t dev) { return (uint8_t)digitalRead(dev); }
+
+void rfm_setup(uint32_t seed) {
+  uint8_t rfm95_ver = 0;
+
+  pinMode(DIO0_PIN, INPUT);
+  pinMode(DIO5_PIN, INPUT);
+  pinMode(NSS_PIN, OUTPUT);
+
+  rfm95_dev.nss_pin_id = NSS_PIN;
+  rfm95_dev.dio0_pin_id = DIO0_PIN;
+  rfm95_dev.dio5_pin_id = DIO5_PIN;
+  rfm95_dev.spi_write = duplexSpi;
+  rfm95_dev.spi_read = duplexSpi;
+  rfm95_dev.delay = (rfm95_delay_fptr_t)delay;
+  rfm95_dev.pin_read = readPin;
+
+  while (rfm95_ver != 0x12) {
+    rfm95_ver = rfm95_init(&rfm95_dev, seed);
+  }
+  rfm95_recv(&rfm95_dev);
 }
 
 void setup() {
@@ -234,7 +275,9 @@ void setup() {
   esp_updater.setup(&web_server);
   setup_webserver();
 
-  last_counter_reset = millis();
+  SPI.begin();
+  rfm_setup(analogRead(A0) + WiFi.RSSI());
+  last_message = millis();
   attachInterrupt(digitalPinToInterrupt(DIO0_PIN), event, RISING);
 }
 
@@ -249,35 +292,55 @@ bool check_ntptime() {
   return have_time;
 }
 
-void on_interval_elapsed(uint32_t elapsed, uint32_t counts) {
-  if( counts ) {
-    uint8_t len = rfm95_getfifo(dev, buf, sizeof(buf));
-    if( len == sizeof(payload) && payload.magic == PAYLOAD_MAGIC && verify_checksum(payload) ) {
-      syslog.logf(LOG_INFO, "New payload after %u seconds: "
-                  "Events CPM: 5s=%2u,  1m=%2u,  10m=%2u,  "
-                  "1h=%2u,  1d=%2u,  RAW: "
-                  "5s=%2u,  1m=%2u,  10m=%3u,  1h=%4u,  1d=%5u",
-                  elapsed / 1000, );
+bool handle_event() {
+  bool valid = false;
+  uint8_t buf[0xff];
+  signal_t sig;
+  uint8_t len = rfm95_fifo(&rfm95_dev, buf, sizeof(buf), &sig);
+  rfm95_recv(&rfm95_dev); // TODO: needed?
+  if (len == sizeof(payload)) {
+    payload_t *p = (payload_t *)buf;
+    if (p->magic == PAYLOAD_MAGIC && checksum(p) == p->check) {
+      payload_received = time(NULL);
+      payload = *p;
+      signal = sig;
+      valid = true;
+      syslog.logf(
+          LOG_INFO, "Received mVcc=%u, mVbat=%u, mVaccu=%u, snr=%d, rssi=%d",
+          payload.mVcc, payload.mVbat, payload.mVaccu, signal.snr, signal.rssi);
       post_data();
+    } else {
+      syslog.logf(LOG_DEBUG,
+                  "Received invalid packet mVcc=%u, mVbat=%u, mVaccu=%u, "
+                  "snr=%d, rssi=%d",
+                  payload.mVcc, payload.mVbat, payload.mVaccu, signal.snr,
+                  signal.rssi);
     }
   } else {
-    syslog.logf(LOG_NOTICE, "No payload since %u seconds", elapsed / 1000);
+    syslog.logf(LOG_DEBUG, "Received packet with wrong length %u", len);
   }
+  return valid;
 }
 
 void check_events() {
-  static const uint32_t max_interval = 600*1000; // ms to wait for RF Rx
+  static const uint32_t max_interval = 600 * 1000; // ms to wait for RF Rx
 
   uint32_t now = millis();
-  uint32_t elapsed = now - last_counter_reset;
-  if (counter_events || elapsed >= max_interval) {
-    uint32_t events = counter_events;
-
+  bool valid = false;
+  if (counter_events) {
     counter_events = 0;
-    last_counter_reset += counter_interval;
+    valid = handle_event();
+    if (valid) {
+      last_message = now;
+    }
+  }
 
-    // either Rx happened or log interval elapsed
-    on_interval_elapsed(elapsed, events);
+  if (!valid) {
+    uint32_t elapsed = now - last_message;
+    if (elapsed >= max_interval) {
+      last_message += max_interval;
+      syslog.logf(LOG_NOTICE, "No payload since %u seconds", elapsed / 1000);
+    }
   }
 }
 

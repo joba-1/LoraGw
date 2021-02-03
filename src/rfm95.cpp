@@ -1,5 +1,5 @@
 /*
-  rfm95.c - ported to C on STM32 by Joachim Banzhaf 2020
+  rfm95.c - ported to C on STM32 and to ESP8266 by Joachim Banzhaf 2020/2021
   RFM95.cpp - Library for RFM95 LoRa module.
   Created by Leo Korbee, March 31, 2018.
   Released into the public domain.
@@ -10,27 +10,32 @@
 
 #include "rfm95.h"
 
+#include <Arduino.h>
 
-static uint32_t miState;
+#include <stdint.h>
 
-int32_t rand1( void )
-{
+#ifdef ESP8266
+  int32_t rand1(void) { return (int32_t)random(INT32_MAX); }
+  void srand1(uint32_t seed) { randomSeed((int32_t)seed); }
+#else
+  static uint32_t miState;
+
+  int32_t rand1(void) {
     miState ^= (miState << 13);
     miState ^= (miState >> 17);
     miState ^= (miState << 15);
 
     return (miState * 1332534557) & 0x7FFFFFFF;
-}
+  }
 
-void srand1( uint32_t seed )
-{
+  void srand1( uint32_t seed ) {
     // a zero seed will not work!
     if (seed == 0)
         seed = 0x55aaff01;
 
     miState = seed;
-}
-
+  }
+#endif
 
 /*
 *****************************************************************************************
@@ -96,7 +101,7 @@ uint8_t rfm95_init( rfm95_t *dev, uint32_t seed ) {
     max_wait--;
     (*dev->delay)(1);
   }
-  if( !max_wait ) putstr("dio5! ");
+  if( !max_wait ) puts("dio5! ");
   // (*dev->delay)(10);
 
   // while( rfm95_read(dev, 0x42) != 0x12 ); // check if we can communicate
@@ -180,26 +185,15 @@ uint8_t rfm95_read( rfm95_t *dev, uint8_t addr ) {
   return data;
 }
 
-
 /*
 *****************************************************************************************
-* Description : Function for receiving a package with the RFM
-*
-* Arguments   : buffer:  Pointer to array with data to be read
-*               len:     Length of the buffer
-* Return      : number of received bytes
+* Description : Function to prepare receiving a package into the RFM fifo.
+* Frequency, spreading factor, bandwidth and error coding rate hardcoded for now...
+* Return      : frequency
 *****************************************************************************************
 */
 
-uint32_t rfm95_recv( rfm95_t *dev, uint8_t *buffer, uint32_t len, signal_t *sig ) {
-  if( len == 0 || buffer == 0 ) {
-	  return 0; // No place to store data
-  }
-
-  if( len > 0xff ) {
-	  len = 0xff;
-  }
-
+uint32_t rfm95_recv( rfm95_t *dev ) {
   //Set RFM in Standby mode wait on mode ready
   rfm95_write(dev, 0x01, 0x81);
 
@@ -209,13 +203,13 @@ uint32_t rfm95_recv( rfm95_t *dev, uint8_t *buffer, uint32_t len, signal_t *sig 
     max_wait--;
     (*dev->delay)(1);
   }
-  if( !max_wait ) putstr("dio5! ");
+  if( !max_wait ) puts("dio5! ");
 
   //Switch DIO0 to RxDone
   rfm95_write(dev, 0x40, 0x00);
 
   //rfm95_freq(dev, rand1() % 8);
-  rfm95_freq(dev, 2); // channel 2 is highest freq (868.5MHz) with 1% allowed usage per hour in germany
+  rfm95_freq(dev, 2); // channel 2 is highest channel freq (868.5MHz) with 1% allowed usage per hour in germany
 
   //SF7 BW 125 kHz
   rfm95_write(dev, 0x1E, 0x74); //SF7 CRC On
@@ -226,8 +220,8 @@ uint32_t rfm95_recv( rfm95_t *dev, uint8_t *buffer, uint32_t len, signal_t *sig 
   //rfm95_write(dev, 0x33, 0x27);
   //rfm95_write(dev, 0x3B, 0x1D);
 
-  //Set payload length to the buffer length (max 0xff)
-  rfm95_write(dev, 0x22, len);
+  //Set payload length to max (0xff)
+  rfm95_write(dev, 0x22, 0xff);
 
   // Clear interrupts and enable RxDone and Timeout interrupts
   rfm95_write(dev, 0x12, 0xff);
@@ -239,31 +233,43 @@ uint32_t rfm95_recv( rfm95_t *dev, uint8_t *buffer, uint32_t len, signal_t *sig 
   //now wait for data
   rfm95_write(dev, 0x01, 0x05);
 
-  while( !(*dev->pin_read)(dev->dio0_pin_id) );
+  return 868500000; // fixed freq (of ch 2) for now...
+}
+
+/*
+ *****************************************************************************************
+ * Description : Function for getting a received package from the fifo of the RFM
+ *
+ * Arguments   : buffer:  Pointer to array that gets the data
+ *               len:     Length of the array
+ *               sig:     signal quality
+ * Return      : received bytes (can be more than len!)
+ *****************************************************************************************
+ */
+uint32_t rfm95_fifo(rfm95_t *dev, uint8_t *buf, uint32_t len, signal_t *sig) {
+  // If you want to make sure dio0 signaled rxDone
+  // while (!(*dev->pin_read)(dev->dio0_pin_id))
+  //   ;
 
   uint8_t flags = rfm95_read(dev, 0x12);
-  if( sig ) {
-	  sig->flags = flags;
-	  sig->snr = - (int)rfm95_read(dev, 0x19) / 4;
-	  sig->rssi = -137 + rfm95_read(dev, 0x1a);
+  if (sig) {
+    sig->flags = flags;
+    sig->snr = -(int)rfm95_read(dev, 0x19) / 4; // TODO: see datasheet 5.5.5.
+    sig->rssi = -137 + rfm95_read(dev, 0x1a);   // TODO: RSSI in LoRaTM Mode
   }
 
   uint32_t received = 0;
-  if( flags == 0x40 ) {
-	  uint8_t addr = rfm95_read(dev, 0x10); // current rx fifo addr
-	  rfm95_write(dev, 0x0D, addr);
-	  received = rfm95_read(dev, 0x13);
-	  if( received > len ) {
-		received = len;
-	  }
-	  (*dev->spi_read)(dev->nss_pin_id, 0, buffer, received);
+  if (flags == 0x40) {
+    uint8_t addr = rfm95_read(dev, 0x10); // current rx fifo addr
+    rfm95_write(dev, 0x0D, addr);
+    received = rfm95_read(dev, 0x13);
+    (*dev->spi_read)(dev->nss_pin_id, 0, buf, min(received, len));
   }
 
   rfm95_write(dev, 0x12, 0xff); // clear interrupt flags again
 
   return received;
 }
-
 
 /*
 *****************************************************************************************
@@ -275,30 +281,31 @@ uint32_t rfm95_recv( rfm95_t *dev, uint8_t *buffer, uint32_t len, signal_t *sig 
 *****************************************************************************************
 */
 
-uint32_t rfm95_send( rfm95_t *dev, uint8_t *buffer, uint32_t len ) {
+uint32_t rfm95_send(rfm95_t *dev, uint8_t *buffer, uint32_t len) {
   // unsigned char RFM_Tx_Location = 0x00;
 
-  if( len == 0 || len > 64 ) {
-	  return 0; // Nothing to send or fifo length exceeded
+  if (len == 0 || len > 64) {
+    return 0; // Nothing to send or fifo length exceeded
   }
 
-  //Set RFM in Standby mode wait on mode ready
+  // Set RFM in Standby mode wait on mode ready
   rfm95_write(dev, 0x01, 0x81);
 
-  //Wait for Ready
+  // Wait for Ready
   uint8_t max_wait = 200;
-  while (max_wait && !(*dev->pin_read)(dev->dio5_pin_id) ) {
+  while (max_wait && !(*dev->pin_read)(dev->dio5_pin_id)) {
     max_wait--;
     (*dev->delay)(1);
   }
-  if( !max_wait ) putstr("dio5! ");
+  if (!max_wait)
+    puts("dio5! ");
 
-  //Switch DIO0 to TxDone
+  // Switch DIO0 to TxDone
   rfm95_write(dev, 0x40, 0x40);
 
   // while( rfm95_read(dev, 0x42) != 0x12 ); // check if we can communicate
 
-  //Set carrier frequency
+  // Set carrier frequency
 
   /*
   fixed frequency
@@ -308,45 +315,49 @@ uint32_t rfm95_send( rfm95_t *dev, uint8_t *buffer, uint32_t len ) {
   _rfm95.RFM_Write(0x08,0x8B);
   */
 
-  //rfm95_freq(dev, rand1() % 8);
-  rfm95_freq(dev, 2); // channel 2 is highest freq (868.5MHz) with 1% allowed usage per hour in germany
+  // rfm95_freq(dev, rand1() % 8);
+  rfm95_freq(dev, 2); // channel 2 is highest freq (868.5MHz) with 1% allowed
+                      // usage per hour in germany
 
-  //SF7 BW 125 kHz
-  rfm95_write(dev, 0x1E, 0x74); //SF7 CRC On
-  rfm95_write(dev, 0x1D, 0x72); //125 kHz 4/5 coding rate explicit header mode
-  rfm95_write(dev, 0x26, 0x04); //Low datarate optimization off AGC auto on
+  // SF7 BW 125 kHz
+  rfm95_write(dev, 0x1E, 0x74); // SF7 CRC On
+  rfm95_write(dev, 0x1D, 0x72); // 125 kHz 4/5 coding rate explicit header
+                                // mode
+  rfm95_write(dev, 0x26, 0x04); // Low datarate optimization off AGC auto on
 
-  //Set IQ to normal values
+  // Set IQ to normal values
   rfm95_write(dev, 0x33, 0x27);
   rfm95_write(dev, 0x3B, 0x1D);
 
-  //Set payload length to the right length
+  // Set payload length to the right length
   rfm95_write(dev, 0x22, len);
 
-  //Get location of Tx part of FiFo
-  //RFM_Tx_Location = RFM_Read(0x0E);
+  // Get location of Tx part of FiFo
+  // RFM_Tx_Location = RFM_Read(0x0E);
 
-  //Set SPI pointer to start of Tx part in FiFo
-  //RFM_Write(0x0D,RFM_Tx_Location);
-  rfm95_write(dev, 0x0D, 0x80); // hardcoded fifo location according RFM95 specs
+  // Set SPI pointer to start of Tx part in FiFo
+  // RFM_Write(0x0D,RFM_Tx_Location);
+  rfm95_write(dev, 0x0D,
+              0x80); // hardcoded fifo location according RFM95 specs
 
-  //Write Payload to FiFo
+  // Write Payload to FiFo
   while (len--) {
     rfm95_write(dev, 0x00, *(buffer++));
   }
 
-  //Switch RFM to Tx
+  // Switch RFM to Tx
   rfm95_write(dev, 0x01, 0x83);
 
-  //Wait for TxDone
+  // Wait for TxDone
   max_wait = 200;
-  while (max_wait && !(*dev->pin_read)(dev->dio0_pin_id) ) {
+  while (max_wait && !(*dev->pin_read)(dev->dio0_pin_id)) {
     max_wait--;
     (*dev->delay)(1);
   }
-  if( !max_wait ) putstr("dio0! ");
+  if (!max_wait)
+    puts("dio0! ");
 
-  //What's the frequency, kenneth?
+  // What's the frequency, kenneth?
   uint32_t freq = rfm95_read(dev, 0x06);
   freq <<= 8;
   freq |= rfm95_read(dev, 0x07);
@@ -357,8 +368,8 @@ uint32_t rfm95_send( rfm95_t *dev, uint8_t *buffer, uint32_t len ) {
   freq /= 1000;
   freq *= 313;
 
-  //Switch RFM to sleep
+  // Switch RFM to sleep
   rfm95_write(dev, 0x01, 0x00);
 
   return freq;
-}
+  }
