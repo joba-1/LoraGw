@@ -19,6 +19,7 @@
 // Lora
 #include <SPI.h>
 #include <rfm95.h>
+#include <payload.h>
 
 #define ARRAY_SIZE(a) (sizeof(a) / sizeof(*(a)))
 
@@ -58,14 +59,6 @@ static char start_time[30] = "";
 WiFiUDP logUDP;
 Syslog syslog(logUDP, SYSLOG_PROTO_IETF);
 
-typedef struct payload {
-  uint16_t magic;
-  uint16_t mVcc;
-  uint16_t mVbat;
-  uint16_t mVaccu;
-  uint16_t check;
-} payload_t;
-
 payload_t payload = {0}; // last received payload
 time_t payload_received;
 signal_t signal = {0};                // last received signal quality
@@ -74,11 +67,6 @@ volatile uint32_t counter_events = 0; // events of current interval so far
 rfm95_t rfm95_dev;
 
 ICACHE_RAM_ATTR void event() { counter_events++; }
-
-// checksum for payload
-uint32 checksum(payload_t *p) {
-  return p->magic + p->mVaccu + p->mVbat + p->mVcc;
-}
 
 // Post data to InfluxDB
 void post_data() {
