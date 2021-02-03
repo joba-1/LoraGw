@@ -262,6 +262,10 @@ void setup() {
   }
 
   digitalWrite(DB_LED_PIN, DB_LED_ON);
+
+  pinMode(RF_LED_PIN, OUTPUT);
+  digitalWrite(RF_LED_PIN, RF_LED_ON);
+
   char msg[80];
   snprintf(msg, sizeof(msg), "%s Version %s, WLAN IP is %s", PROGNAME, VERSION,
            WiFi.localIP().toString().c_str());
@@ -279,6 +283,7 @@ void setup() {
   rfm_setup(analogRead(A0) + WiFi.RSSI());
   last_message = millis();
   attachInterrupt(digitalPinToInterrupt(DIO0_PIN), event, RISING);
+  digitalWrite(RF_LED_PIN, RF_LED_OFF);
 }
 
 bool check_ntptime() {
@@ -297,7 +302,8 @@ bool handle_event() {
   uint8_t buf[0xff];
   signal_t sig;
   uint8_t len = rfm95_fifo(&rfm95_dev, buf, sizeof(buf), &sig);
-  rfm95_recv(&rfm95_dev); // TODO: needed?
+  // rfm95_recv(&rfm95_dev); // TODO: needed?
+  digitalWrite(RF_LED_PIN, RF_LED_ON);
   if (len == sizeof(payload)) {
     payload_t *p = (payload_t *)buf;
     if (p->magic == PAYLOAD_MAGIC && checksum(p) == p->check) {
@@ -317,8 +323,15 @@ bool handle_event() {
                   signal.rssi);
     }
   } else {
-    syslog.logf(LOG_DEBUG, "Received packet with wrong length %u", len);
+    if( len == 4 ) {
+      syslog.logf(LOG_DEBUG, "Received old packet %u: %u mV",
+                  buf[3] * 256 + buf[2], buf[1] * 256 + buf[0]);
+    }
+    else {
+      syslog.logf(LOG_DEBUG, "Received packet with wrong length %u", len);
+    }
   }
+  digitalWrite(RF_LED_PIN, RF_LED_OFF);
   return valid;
 }
 
