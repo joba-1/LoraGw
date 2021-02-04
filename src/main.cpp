@@ -36,8 +36,6 @@
 
 #define WEBSERVER_PORT 80
 
-#define PAYLOAD_MAGIC 0x04ec38ed
-
 ESP8266WebServer web_server(WEBSERVER_PORT);
 
 ESP8266HTTPUpdateServer esp_updater;
@@ -72,12 +70,12 @@ ICACHE_RAM_ATTR void event() { counter_events++; }
 void post_data() {
   static const char uri[] = "/write?db=" INFLUX_DB "&precision=s";
 
-  char fmt[] = "payload,dev=" HOSTNAME
-               ",ver=%s vcc=%.3f,vbat=%.3f,vaccu=%.3f,snr=%d,rssi=%d\n";
+  char fmt[] = "payload,gw='" HOSTNAME "',ver=%s,dev=0x%08x"
+               " vcc=%.3f,vbat=%.3f,vaccu=%.3f,snr=%d,rssi=%d,celsius=%.1f\n";
   char msg[sizeof(fmt) + 20 + 3 * 10];
-  snprintf(msg, sizeof(msg), fmt, VERSION, payload.mVcc / 1000.0,
+  snprintf(msg, sizeof(msg), fmt, VERSION, payload.id, payload.mVcc / 1000.0,
            payload.mVbat / 1000.0, payload.mVaccu / 1000.0, signal.snr,
-           signal.rssi);
+           signal.rssi, payload.dCelsius / 10.0);
   http.begin(client, INFLUX_SERVER, INFLUX_PORT, uri);
   http.setUserAgent(PROGNAME);
   influx_status = http.POST(msg);
@@ -104,8 +102,11 @@ void setup_webserver() {
                               "  \"spreading\": 7,\n"
                               "  \"bandwidth\": 125,\n"
                               "  \"codingrate\": 0.8,\n"
-                              "  \"started\": \"%s\",\n"
-                              "  \"measured\": \"%s\"\n"
+                              "  \"started\": \"%s\"\n"
+                              " },\n"
+                              " \"source\": {\n"
+                              "  \"measured\": \"%s\",\n"
+                              "  \"device\": %u\n"
                               " },\n"
                               " \"voltage\": {\n"
                               "  \"vcc\": %.3f,\n"
@@ -121,7 +122,7 @@ void setup_webserver() {
     static char iso_time[30];
     strftime(iso_time, sizeof(iso_time), "%FT%T%Z",
              localtime(&payload_received));
-    snprintf(msg, sizeof(msg), fmt, start_time, iso_time, payload.mVcc / 1000.0,
+    snprintf(msg, sizeof(msg), fmt, start_time, iso_time, payload.id, payload.mVcc / 1000.0,
              payload.mVbat / 1000.0, payload.mVaccu / 1000.0, signal.snr,
              signal.rssi);
     web_server.send(200, "application/json", msg);
@@ -294,14 +295,14 @@ bool handle_event() {
   digitalWrite(RF_LED_PIN, RF_LED_ON);
   if (len == sizeof(payload)) {
     payload_t *p = (payload_t *)buf;
-    if (p->magic == PAYLOAD_MAGIC && checksum(p) == p->check) {
+    if (p->magic == PAYLOAD_MAGIC && payload_checksum(p) == p->check) {
       payload_received = time(NULL);
       payload = *p;
       signal = sig;
       valid = true;
       syslog.logf(
-          LOG_INFO, "Received mVcc=%u, mVbat=%u, mVaccu=%u, snr=%d, rssi=%d",
-          payload.mVcc, payload.mVbat, payload.mVaccu, signal.snr, signal.rssi);
+          LOG_INFO, "Received from 0x%08x: mVcc=%u, mVbat=%u, mVaccu=%u, snr=%d, rssi=%d, dcelsius=%u",
+          payload.id, payload.mVcc, payload.mVbat, payload.mVaccu, signal.snr, signal.rssi, payload.dCelsius);
       post_data();
     } else {
       syslog.logf(LOG_DEBUG,
