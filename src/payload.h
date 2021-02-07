@@ -12,10 +12,10 @@ extern "C" {
 typedef struct payload {
   uint32_t magic;
   uint32_t id;
-  uint16_t mVcc;
-  uint16_t mVbat;
-  uint16_t mVaccu;
-  uint16_t dCelsius;
+  int16_t mVcc;
+  int16_t mVbat;
+  int16_t mVaccu;
+  int16_t dCelsius;
   uint32_t check;
 } payload_t;
 

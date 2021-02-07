@@ -306,10 +306,10 @@ bool handle_event() {
       post_data();
     } else {
       syslog.logf(LOG_DEBUG,
-                  "Received invalid packet mVcc=%u, mVbat=%u, mVaccu=%u, "
-                  "snr=%d, rssi=%d",
-                  payload.mVcc, payload.mVbat, payload.mVaccu, signal.snr,
-                  signal.rssi);
+                  "Invalid from 0x%08x: mVcc=%u, mVbat=%u, mVaccu=%u, snr=%d, "
+                  "rssi=%d, dcelsius=%u",
+                  payload.id, payload.mVcc, payload.mVbat, payload.mVaccu,
+                  signal.snr, signal.rssi, payload.dCelsius);
     }
   } else {
     if( len == 4 ) {
