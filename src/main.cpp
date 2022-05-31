@@ -1,5 +1,8 @@
 #include <Arduino.h>
 
+// This is in Arduino.h, but I keep getting not defined???
+#define PWMRANGE 1023
+
 // Web Updater
 #include <ESP8266HTTPUpdateServer.h>
 #include <ESP8266WebServer.h>
@@ -64,27 +67,41 @@ uint32_t last_message = 0;            // millis() of last counter reset
 volatile uint32_t counter_events = 0; // events of current interval so far
 rfm95_t rfm95_dev;
 
-ICACHE_RAM_ATTR void event() { counter_events++; }
+IRAM_ATTR void event() { counter_events++; }
 
 // Post data to InfluxDB
 void post_data() {
   static const char uri[] = "/write?db=" INFLUX_DB "&precision=s";
 
-  char fmt[] = "payload,gw='" HOSTNAME "',ver=%s,dev=0x%08x"
-               " vcc=%.3f,vbat=%.3f,vaccu=%.3f,snr=%d,rssi=%d,celsius=%.1f\n";
-  char msg[sizeof(fmt) + 20 + 3 * 10];
-  snprintf(msg, sizeof(msg), fmt, VERSION, payload.id, payload.mVcc / 1000.0,
-           payload.mVbat / 1000.0, payload.mVaccu / 1000.0, signal.snr,
-           signal.rssi, payload.dCelsius / 10.0);
+  char fmtBme[] = "payload,gw='" HOSTNAME "',ver=%s,dev=0x%08x"
+                  " vcc=%.3f,vbat=%.3f,hpa=%.3f,humidity=%.3f,snr=%d,rssi=%d,celsius=%.1f\n";
+  char fmtAdc[] = "payload,gw='" HOSTNAME "',ver=%s,dev=0x%08x"
+                  " vcc=%.3f,vbat=%.3f,vaccu=%.3f,snr=%d,rssi=%d,celsius=%.1f\n";
+  char msg[sizeof(fmtBme) + 20 + 3 * 10];
+  payload_bme_t *bme;
+  payload_adc_t *adc;
+
+  if( payload.magic == PAYLOAD_MAGIC_ADC) {
+    adc = (payload_adc_t *)&payload.data;
+    snprintf(msg, sizeof(msg), fmtAdc, VERSION, payload.id, adc->mVcc / 1000.0,
+             adc->mVbat / 1000.0, adc->mVaccu / 1000.0, signal.snr,
+             signal.rssi, adc->dCelsius / 10.0);
+  }
+  else {
+    bme = (payload_bme_t *)&payload.data;
+    snprintf(msg, sizeof(msg), fmtBme, VERSION "b", payload.id, bme->mVcc / 1000.0,
+             bme->mVbat / 1000.0, bme->paPressure / 100.0, bme->mpHumi / 1000.0, 
+             signal.snr, signal.rssi, bme->ctCelsius / 100.0);
+  }
   http.begin(client, INFLUX_SERVER, INFLUX_PORT, uri);
   http.setUserAgent(PROGNAME);
   influx_status = http.POST(msg);
-  String payload = http.getString();
+  String resp = http.getString();
   http.end();
   if (influx_status < 200 || influx_status > 299) {
     breathe_interval = err_interval;
     syslog.logf(LOG_ERR, "Post %s:%d%s status %d response '%s'", INFLUX_SERVER,
-                INFLUX_PORT, uri, influx_status, payload.c_str());
+                INFLUX_PORT, uri, influx_status, resp.c_str());
   } else {
     breathe_interval = ok_interval;
   };
@@ -93,6 +110,14 @@ void post_data() {
 // Define web pages for update, reset or for event infos
 void setup_webserver() {
   web_server.on("/payload", []() {
+    static const char fmtAdc[] = "  \"vcc\": %.3f,\n"
+                                 "  \"vbat\": %.3f,\n"
+                                 "  \"vaccu\": %.3f\n";
+    static const char fmtBme[] = "  \"vcc\": %.3f,\n"
+                                 "  \"vbat\": %.3f,\n"
+                                 "  \"hpa\": %.3f,\n"
+                                 "  \"humi\": %.3f,\n"
+                                 "  \"celsius\": %.3f\n";
     static const char fmt[] = "{\n"
                               " \"meta\": {\n"
                               "  \"device\": \"" HOSTNAME "\",\n"
@@ -108,23 +133,33 @@ void setup_webserver() {
                               "  \"measured\": \"%s\",\n"
                               "  \"device\": %u\n"
                               " },\n"
-                              " \"voltage\": {\n"
-                              "  \"vcc\": %.3f,\n"
-                              "  \"vbat\": %.3f,\n"
-                              "  \"vaccu\": %.3f\n"
+                              " \"data\": {\n"
+                              "%s"
                               " },\n"
                               " \"signal\": {\n"
-                              "  \"snr\": %u,\n"
-                              "  \"rssi\": %u\n"
+                              "  \"snr\": %d,\n"
+                              "  \"rssi\": %d\n"
                               " }\n"
                               "}\n";
-    static char msg[sizeof(fmt) + 2 * 20 + 5 * 10];
+    static char msg[sizeof(fmt) + sizeof(fmtBme) + 2 * 20 + 5 * 10];
     static char iso_time[30];
+    static char data[sizeof(fmtBme) + 20];
     strftime(iso_time, sizeof(iso_time), "%FT%T%Z",
              localtime(&payload_received));
-    snprintf(msg, sizeof(msg), fmt, start_time, iso_time, payload.id, payload.mVcc / 1000.0,
-             payload.mVbat / 1000.0, payload.mVaccu / 1000.0, signal.snr,
-             signal.rssi);
+    payload_bme_t *bme;
+    payload_adc_t *adc;
+    if( payload.magic == PAYLOAD_MAGIC_ADC) {
+      adc = (payload_adc_t *)&payload.data;
+      snprintf(data, sizeof(data), fmtAdc, adc->mVcc / 1000.0, 
+               adc->mVbat / 1000.0, adc->mVaccu / 1000.0);
+    }
+    else {
+      bme = (payload_bme_t *)&payload.data;
+      snprintf(data, sizeof(data), fmtBme, bme->mVcc / 1000.0, bme->mVbat / 1000.0, 
+               bme->paPressure / 100.0, bme->mpHumi / 1000.0, bme->ctCelsius / 100.0);
+    }
+    snprintf(msg, sizeof(msg), fmt, start_time, iso_time, payload.id, data,
+             signal.snr, signal.rssi);
     web_server.send(200, "application/json", msg);
   });
 
@@ -293,25 +328,38 @@ bool handle_event() {
   uint8_t len = rfm95_fifo(&rfm95_dev, buf, sizeof(buf), &sig);
   // rfm95_recv(&rfm95_dev); // TODO: needed?
   digitalWrite(RF_LED_PIN, RF_LED_ON);
-  if (len == sizeof(payload)) {
-    payload_t *p = (payload_t *)buf;
-    if (p->magic == PAYLOAD_MAGIC && payload_checksum(p) == p->check) {
+  payload_t *p = (payload_t *)buf;
+  payload_bme_t *bme;
+  payload_adc_t *adc;
+  if ((len == sizeof(payload))
+   || (len == sizeof(payload) - sizeof(payload_bme_t) + sizeof(payload_adc_t))) {
+    if ((p->magic == PAYLOAD_MAGIC_BME || p->magic == PAYLOAD_MAGIC_ADC) 
+     && payload_is_valid(p)) {
       payload_received = time(NULL);
       payload = *p;
       signal = sig;
       valid = true;
-      syslog.logf(
-          LOG_INFO, "Received from 0x%08x: mVcc=%u, mVbat=%u, mVaccu=%u, snr=%d, rssi=%d, dcelsius=%u",
-          payload.id, payload.mVcc, payload.mVbat, payload.mVaccu, signal.snr, signal.rssi, payload.dCelsius);
+      if(p->magic == PAYLOAD_MAGIC_BME) {
+        bme = (payload_bme_t *)&p->data;
+        syslog.logf(
+          LOG_INFO, "Received from 0x%08x: mVcc=%d, mVbat=%d, pascal=%u, mpHumidity=%u, snr=%d, rssi=%d, ctCelsius=%d",
+          payload.id, bme->mVcc, bme->mVbat, bme->paPressure, bme->mpHumi, signal.snr, signal.rssi, bme->ctCelsius);
+      }
+      else {
+        adc = (payload_adc_t *)&p->data;
+        syslog.logf(
+          LOG_INFO, "Received from 0x%08x: mVcc=%d, mVbat=%d, mVaccu=%d, snr=%d, rssi=%d, dCelsius=%d",
+          payload.id, adc->mVcc, adc->mVbat, adc->mVaccu, signal.snr, signal.rssi, adc->dCelsius);
+      }
       post_data();
-    } else {
-      syslog.logf(LOG_DEBUG,
-                  "Invalid from 0x%08x: mVcc=%u, mVbat=%u, mVaccu=%u, snr=%d, "
-                  "rssi=%d, dcelsius=%u",
-                  payload.id, payload.mVcc, payload.mVbat, payload.mVaccu,
-                  signal.snr, signal.rssi, payload.dCelsius);
+    } 
+    else {
+      syslog.logf(
+        LOG_DEBUG, "Invalid payload from 0x%08x: magic=%x, snr=%d, rssi=%d",
+        p->id, p->magic, signal.snr, signal.rssi);
     }
-  } else {
+  } 
+  else {
     if( len == 4 ) {
       syslog.logf(LOG_DEBUG, "Received old packet %u: %u mV",
                   buf[3] * 256 + buf[2], buf[1] * 256 + buf[0]);

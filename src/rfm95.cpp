@@ -119,7 +119,7 @@ uint8_t rfm95_init( rfm95_t *dev, uint32_t seed ) {
   rfm95_write(dev, 0x1D, 0x72);
 
   //Spreading factor 7, PayloadCRC On
-  rfm95_write(dev, 0x1E, 0xB4);
+  rfm95_write(dev, 0x1E, 0xB4); // TODO: send uses 0x74
 
   //Rx Timeout set to 37 symbols
   rfm95_write(dev, 0x1F, 0x25);
@@ -337,8 +337,7 @@ uint32_t rfm95_send(rfm95_t *dev, uint8_t *buffer, uint32_t len) {
 
   // Set SPI pointer to start of Tx part in FiFo
   // RFM_Write(0x0D,RFM_Tx_Location);
-  rfm95_write(dev, 0x0D,
-              0x80); // hardcoded fifo location according RFM95 specs
+  rfm95_write(dev, 0x0D, 0x80); // hardcoded fifo location according RFM95 specs
 
   // Write Payload to FiFo
   while (len--) {
