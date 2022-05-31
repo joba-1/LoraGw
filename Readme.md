@@ -1,6 +1,6 @@
 # Lora Gateway with ESP8266
 
-Receive messages from lora nodes and post them on syslog and influx
+Receive messages from lora nodes like [my STM32L0LoraTx](https://github.com/joba-1/STM32L0LoraTx) and post them on syslog and influx
 
 ## Hardware
 
