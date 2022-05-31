@@ -312,7 +312,7 @@ void setup() {
 
 bool check_ntptime() {
   static bool have_time = false;
-  if (!have_time && ntp.getEpochTime()) {
+  if (!have_time && ntp.getEpochTime() > (2000UL - 1970) * 365 * 24 * 60 * 60) {
     have_time = true;
     time_t now = time(NULL);
     strftime(start_time, sizeof(start_time), "%FT%T%Z", localtime(&now));
