@@ -374,6 +374,7 @@ bool handle_event() {
 
 void check_events() {
   static const uint32_t max_interval = 600 * 1000; // ms to wait for RF Rx
+  static uint32_t silent_intervals = 0;
 
   uint32_t now = millis();
   bool valid = false;
@@ -382,6 +383,7 @@ void check_events() {
     valid = handle_event();
     if (valid) {
       last_message = now;
+      silent_intervals = 0;
     }
   }
 
@@ -389,7 +391,21 @@ void check_events() {
     uint32_t elapsed = now - last_message;
     if (elapsed >= max_interval) {
       last_message += max_interval;
-      syslog.logf(LOG_NOTICE, "No payload since %u seconds", elapsed / 1000);
+      uint32_t silent_seconds = ((silent_intervals * max_interval) + elapsed) / 1000;
+      syslog.logf(LOG_NOTICE, "No payload since %u seconds", silent_seconds);
+      silent_intervals++;
+      if( silent_intervals > 6 ) {
+        syslog.logf(LOG_NOTICE, "Reboot in 1s due to no payloads");
+        for (int i = 0; i < 1000; i += 100) {
+          digitalWrite(DB_LED_PIN, DB_LED_ON);
+          delay(50);
+          digitalWrite(DB_LED_PIN, DB_LED_OFF);
+          delay(50);
+        }
+        ESP.restart();
+        while (true)
+          ;
+      }
     }
   }
 }
