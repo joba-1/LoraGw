@@ -7,11 +7,16 @@
 #include <ESP8266HTTPUpdateServer.h>
 #include <ESP8266WebServer.h>
 #include <ESP8266WiFi.h>
-#include <ESP8266mDNS.h>
 #include <WiFiClient.h>
 
 // Post to InfluxDB
 #include <ESP8266HTTPClient.h>
+
+// Publish via MQTT
+#include <PubSubClient.h>
+
+WiFiClient wifiMqtt;
+PubSubClient mqtt(wifiMqtt);
 
 // Infrastructure
 #include <NTPClient.h>
@@ -23,6 +28,11 @@
 #include <SPI.h>
 #include <rfm95.h>
 #include <payload.h>
+
+unsigned packets_total = 0;
+unsigned packets_bme = 0;
+unsigned packets_adc = 0;
+unsigned packets_invalid = 0;
 
 #define ARRAY_SIZE(a) (sizeof(a) / sizeof(*(a)))
 
@@ -61,13 +71,18 @@ WiFiUDP logUDP;
 Syslog syslog(logUDP, SYSLOG_PROTO_IETF);
 
 payload_t payload = {0}; // last received payload
-time_t payload_received;
+static char valid_time[30] = "";      // last received valid packet
 signal_t signal = {0};                // last received signal quality
 uint32_t last_message = 0;            // millis() of last counter reset
 volatile uint32_t counter_events = 0; // events of current interval so far
 rfm95_t rfm95_dev;
 
-IRAM_ATTR void event() { counter_events++; }
+
+// Interrupt handler on received packages
+IRAM_ATTR void event() { 
+  counter_events++; 
+}
+
 
 // Post data to InfluxDB
 void post_data() {
@@ -107,6 +122,76 @@ void post_data() {
   };
 }
 
+
+// Publish packet to mqtt broker
+void publish() {
+   static const char fmtGen[] = "{\n"
+     " \"meta\":{\"gateway\":\"" HOSTNAME "\",\"version\":\"" VERSION "\",\"device\":\"%08x\",\"started\":\"%s\"},\n"
+     " \"packets\":{\"last\":\"%s\",\"total\":%u,\"bme\":%u,\"adc\":%u,\"invalid\":%u},\n"
+     " \"signal\":{\"snr\":%d,\"rssi\":%d},\n"
+     " \"data\":{\"vcc\":%.3f,\"vbat\":%.3f,";
+  static const char fmtBme[] = "\"hpa\":%.3f,\"humidity\":%.3f,\"celsius\":%.1f}\n}";
+  static const char fmtAdc[] = "\"vaccu\":%.3f}\n}";
+
+  static char gen[sizeof(fmtGen) + 130];
+  static char dat[sizeof(fmtBme) + 20];
+  static char msg[sizeof(gen) + sizeof(dat)];
+
+  if( payload.magic == PAYLOAD_MAGIC_ADC) {
+    payload_adc_t *adc = (payload_adc_t *)&payload.data;
+    snprintf(gen, sizeof(gen), fmtGen, payload.id, start_time, valid_time, 
+      packets_total, packets_bme, packets_adc, packets_invalid,
+      signal.snr, signal.rssi, adc->mVcc / 1000.0, adc->mVbat / 1000.0);
+    snprintf(dat, sizeof(dat), fmtAdc, adc->mVaccu / 1000.0);
+  }
+  else {
+    payload_bme_t *bme = (payload_bme_t *)&payload.data;
+    snprintf(gen, sizeof(gen), fmtGen, payload.id, start_time, valid_time,
+      packets_total, packets_bme, packets_adc, packets_invalid,
+      signal.snr, signal.rssi, bme->mVcc / 1000.0, bme->mVbat / 1000.0);
+    snprintf(dat, sizeof(dat), fmtBme, bme->paPressure / 100.0, bme->mpHumi / 1000.0, bme->ctCelsius / 100.0);
+  }
+
+  snprintf(msg, sizeof(msg), "%s%s", gen, dat);
+  snprintf(gen, sizeof(gen), MQTT_TOPIC "/device/%08x", payload.id);
+
+  if( !mqtt.publish(gen, msg) ) {
+    syslog.logf(LOG_ERR, "Publish %s: '%s' to %s:%d failed", gen, msg, MQTT_BROKER, MQTT_PORT);
+  }
+}
+
+
+// Maintain MQTT connection
+void handle_mqtt() {
+  static const int32_t interval = 5000;  // if disconnected try reconnect this often in ms
+  static uint32_t prev = -interval;      // first connect attempt without delay
+  static char msg[128];
+
+  if (mqtt.connected()) {
+    mqtt.loop();
+  }
+  else {
+    uint32_t now = millis();
+    if (now - prev > interval) {
+      prev = now;
+
+      if (mqtt.connect(HOSTNAME, MQTT_TOPIC "/LWT", 0, true, "Offline")
+      && mqtt.publish(MQTT_TOPIC "/LWT", "Online", true)
+      && mqtt.publish(MQTT_TOPIC "/Version", VERSION, true) ) {
+        snprintf(msg, sizeof(msg), "Connected to MQTT broker %s:%d using topic %s", MQTT_BROKER, MQTT_PORT, MQTT_TOPIC);
+        syslog.log(LOG_NOTICE, msg);
+      }
+      else {
+        int error = mqtt.state();
+        mqtt.disconnect();
+        snprintf(msg, sizeof(msg), "Connect to MQTT broker %s:%d failed with code %d", MQTT_BROKER, MQTT_PORT, error);
+        syslog.log(LOG_ERR, msg);
+      }
+    }
+  }
+}
+
+
 // Define web pages for update, reset or for event infos
 void setup_webserver() {
   web_server.on("/payload", []() {
@@ -142,10 +227,7 @@ void setup_webserver() {
                               " }\n"
                               "}\n";
     static char msg[sizeof(fmt) + sizeof(fmtBme) + 2 * 20 + 5 * 10];
-    static char iso_time[30];
     static char data[sizeof(fmtBme) + 20];
-    strftime(iso_time, sizeof(iso_time), "%FT%T%Z",
-             localtime(&payload_received));
     payload_bme_t *bme;
     payload_adc_t *adc;
     if( payload.magic == PAYLOAD_MAGIC_ADC) {
@@ -158,7 +240,7 @@ void setup_webserver() {
       snprintf(data, sizeof(data), fmtBme, bme->mVcc / 1000.0, bme->mVbat / 1000.0, 
                bme->paPressure / 100.0, bme->mpHumi / 1000.0, bme->ctCelsius / 100.0);
     }
-    snprintf(msg, sizeof(msg), fmt, start_time, iso_time, payload.id, data,
+    snprintf(msg, sizeof(msg), fmt, start_time, valid_time, payload.id, data,
              signal.snr, signal.rssi);
     web_server.send(200, "application/json", msg);
   });
@@ -180,45 +262,64 @@ void setup_webserver() {
 
   // Standard page
   static const char fmt[] =
-      "<html>\n"
-      " <head>\n"
-      "  <title>" PROGNAME " v" VERSION "</title>\n"
-      "  <meta http-equiv=\"expires\" content=\"5\">\n"
-      " </head>\n"
-      " <body>\n"
-      "  <h1>" PROGNAME " v" VERSION "</h1>\n"
-      "  <table><tr>\n"
-      "   <td><form action=\"payload\">\n"
-      "    <input type=\"submit\" name=\"payload\" value=\"Payload as JSON\" "
-      "/>\n"
-      "   </form></td>\n"
-      "   <td><form action=\"reset\" method=\"post\">\n"
-      "    <input type=\"submit\" name=\"reset\" value=\"Reset\" />\n"
-      "   </form></td>\n"
-      "  </tr></table>\n"
-      "  <div>Post firmware image to /update<div>\n"
-      "  <div>Influx status: %d<div>\n"
-      " </body>\n"
-      "</html>\n";
-  static char page[sizeof(fmt) + 10] = "";
+    "<!doctype html>\n"
+    "<html lang=\"en\">\n"
+    " <head>\n"
+    "  <style> th, td { padding: 5px; } </style>\n"
+    "  <meta charset=\"utf-8\">\n"
+    "  <meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">\n"
+    "  <meta http-equiv=\"expires\" content=\"60\">\n"
+    "  <link href=\"data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAABAAAAAQAgMAAABinRfyAAAADFBMVEUqYbutnpTMuq/70SQgIef5AAAAVUlEQVQIHWOAAPkvDAyM3+Y7MLA7NV5g4GVqKGCQYWowYTBhapBhMGB04GE4/0X+M8Pxi+6XGS67XzzO8FH+iz/Dl/q/8gx/2S/UM/y/wP6f4T8QAAB3Bx3jhPJqfQAAAABJRU5ErkJggg==\" rel=\"icon\" type=\"image/x-icon\" />\n"
+    "  <title>" PROGNAME " v" VERSION "</title>\n"
+    " </head>\n"
+    " <body>\n"
+    "  <h1>" PROGNAME " v" VERSION "</h1>\n"
+    "  <table>\n"
+    "   <tr><td><form action=\"payload\">\n"
+    "    <input type=\"submit\" name=\"payload\" value=\"Payload as JSON\" />\n"
+    "   </form></td>\n"
+    "   <td><form action=\"reset\" method=\"post\">\n"
+    "    <input type=\"submit\" name=\"reset\" value=\"Reset\" />\n"
+    "   </form></td></tr>\n"
+    "   <tr><td>Post firmware image to</td><td><a href=\"http://" HOSTNAME "/update\" >http://" HOSTNAME "/update</a></td></tr>\n"
+    "   <tr><td>Influx status</td><td>%d</td></tr>\n"
+    "   <tr><td>MQTT status</td><td>%s</td></tr>\n"
+    "   <tr><td>Started</td><td>%s</td></tr>\n"
+    "   <tr><td>Last receive</td><td>%s</td></tr>\n"
+    "   <tr><td>Last reload</td><td>%s</td></tr>\n"
+    "   <tr><td><small>Author</small></td><td><a href=\"https://github.com/joba-1/LoraGw\" target=\"_blank\"><small>Joachim Banzhaf</small></a></td></tr>\n"
+    "  </table>\n"
+    " </body>\n"
+    "</html>\n";
+  static char page[sizeof(fmt) + 110] = "";
 
   // Index page
   web_server.on("/", []() {
-    snprintf(page, sizeof(page), fmt, influx_status);
+    static char curr_time[30];
+    time_t now;
+    time(&now);
+    strftime(curr_time, sizeof(curr_time), "%FT%T%Z", localtime(&now));
+    const char *connected = mqtt.connected() ? "connected" : "disconnected";
+    snprintf(page, sizeof(page), fmt, influx_status, connected, start_time, valid_time, curr_time);
     web_server.send(200, "text/html", page);
   });
 
   // Catch all page
   web_server.onNotFound([]() {
-    snprintf(page, sizeof(page), fmt, influx_status);
+    static char curr_time[30];
+    time_t now;
+    time(&now);
+    strftime(curr_time, sizeof(curr_time), "%FT%T%Z", localtime(&now));
+    const char *connected = mqtt.connected() ? "connected" : "disconnected";
+    snprintf(page, sizeof(page), fmt, influx_status, connected, start_time, valid_time, curr_time);
     web_server.send(404, "text/html", page);
   });
 
   web_server.begin();
 
-  MDNS.addService("http", "tcp", WEBSERVER_PORT);
   syslog.logf(LOG_NOTICE, "Serving HTTP on port %d", WEBSERVER_PORT);
 }
+
 
 int8_t duplexSpi(uint8_t dev, uint8_t addr, uint8_t *data, uint16_t len) {
   digitalWrite(NSS_PIN, LOW);
@@ -228,7 +329,11 @@ int8_t duplexSpi(uint8_t dev, uint8_t addr, uint8_t *data, uint16_t len) {
   return 0;
 }
 
-uint8_t readPin(uint8_t dev) { return (uint8_t)digitalRead(dev); }
+
+uint8_t readPin(uint8_t dev) { 
+  return (uint8_t)digitalRead(dev); 
+}
+
 
 void rfm_setup(uint32_t seed) {
   uint8_t rfm95_ver = 0;
@@ -250,6 +355,7 @@ void rfm_setup(uint32_t seed) {
   }
   rfm95_recv(&rfm95_dev);
 }
+
 
 void setup() {
   WiFi.mode(WIFI_STA);
@@ -298,10 +404,10 @@ void setup() {
 
   ntp.begin();
 
-  MDNS.begin(HOSTNAME);
-
   esp_updater.setup(&web_server);
   setup_webserver();
+
+  mqtt.setServer(MQTT_BROKER, MQTT_PORT);
 
   SPI.begin();
   rfm_setup(analogRead(A0) + WiFi.RSSI());
@@ -309,6 +415,7 @@ void setup() {
   attachInterrupt(digitalPinToInterrupt(DIO0_PIN), event, RISING);
   digitalWrite(RF_LED_PIN, RF_LED_OFF);
 }
+
 
 bool check_ntptime() {
   static bool have_time = false;
@@ -321,45 +428,54 @@ bool check_ntptime() {
   return have_time;
 }
 
+
 bool handle_event() {
   bool valid = false;
   uint8_t buf[0xff];
   signal_t sig;
   uint8_t len = rfm95_fifo(&rfm95_dev, buf, sizeof(buf), &sig);
-  // rfm95_recv(&rfm95_dev); // TODO: needed?
   digitalWrite(RF_LED_PIN, RF_LED_ON);
   payload_t *p = (payload_t *)buf;
   payload_bme_t *bme;
   payload_adc_t *adc;
+
+  packets_total++;
   if ((len == sizeof(payload))
    || (len == sizeof(payload) - sizeof(payload_bme_t) + sizeof(payload_adc_t))) {
     if ((p->magic == PAYLOAD_MAGIC_BME || p->magic == PAYLOAD_MAGIC_ADC) 
      && payload_is_valid(p)) {
-      payload_received = time(NULL);
       payload = *p;
       signal = sig;
       valid = true;
+      time_t now;
+      time(&now);
+      strftime(valid_time, sizeof(valid_time), "%FT%T%Z", localtime(&now));
       if(p->magic == PAYLOAD_MAGIC_BME) {
+        packets_bme++;
         bme = (payload_bme_t *)&p->data;
         syslog.logf(
           LOG_INFO, "Received from 0x%08x: mVcc=%d, mVbat=%d, pascal=%u, mpHumidity=%u, snr=%d, rssi=%d, ctCelsius=%d",
           payload.id, bme->mVcc, bme->mVbat, bme->paPressure, bme->mpHumi, signal.snr, signal.rssi, bme->ctCelsius);
       }
       else {
+        packets_adc++;
         adc = (payload_adc_t *)&p->data;
         syslog.logf(
           LOG_INFO, "Received from 0x%08x: mVcc=%d, mVbat=%d, mVaccu=%d, snr=%d, rssi=%d, dCelsius=%d",
           payload.id, adc->mVcc, adc->mVbat, adc->mVaccu, signal.snr, signal.rssi, adc->dCelsius);
       }
       post_data();
+      publish();
     } 
     else {
+      packets_invalid++;
       syslog.logf(
         LOG_DEBUG, "Invalid payload from 0x%08x: magic=%x, snr=%d, rssi=%d",
         p->id, p->magic, signal.snr, signal.rssi);
     }
   } 
   else {
+    packets_invalid++;
     if( len == 4 ) {
       syslog.logf(LOG_DEBUG, "Received old packet %u: %u mV",
                   buf[3] * 256 + buf[2], buf[1] * 256 + buf[0]);
@@ -371,6 +487,7 @@ bool handle_event() {
   digitalWrite(RF_LED_PIN, RF_LED_OFF);
   return valid;
 }
+
 
 void check_events() {
   static const uint32_t max_interval = 600 * 1000; // ms to wait for RF Rx
@@ -410,6 +527,7 @@ void check_events() {
   }
 }
 
+
 void breathe() {
   static uint32_t start = 0;
   static uint32_t max_duty = PWMRANGE / 2; // limit max brightness
@@ -435,6 +553,7 @@ void breathe() {
   }
 }
 
+
 void loop() {
   ntp.update();
   if (check_ntptime()) {
@@ -442,5 +561,6 @@ void loop() {
   }
   check_events();
   web_server.handleClient();
+  handle_mqtt();
   delay(1);
 }
