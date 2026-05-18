@@ -1,5 +1,7 @@
 #include <Arduino.h>
 
+#include "web_icons.h"
+
 // This is in Arduino.h, but I keep getting not defined???
 #define PWMRANGE 1023
 
@@ -251,6 +253,7 @@ void setup_webserver() {
     web_server.send(200, "text/html",
                     "<html>\n"
                     " <head>\n"
+                    ICON_LINKS_HTML
                     "  <title>" PROGNAME " v" VERSION "</title>\n"
                     "  <meta http-equiv=\"refresh\" content=\"7; url=/\"> \n"
                     " </head>\n"
@@ -269,7 +272,7 @@ void setup_webserver() {
     "  <meta charset=\"utf-8\">\n"
     "  <meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">\n"
     "  <meta http-equiv=\"expires\" content=\"60\">\n"
-    "  <link href=\"data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAABAAAAAQAgMAAABinRfyAAAADFBMVEUqYbutnpTMuq/70SQgIef5AAAAVUlEQVQIHWOAAPkvDAyM3+Y7MLA7NV5g4GVqKGCQYWowYTBhapBhMGB04GE4/0X+M8Pxi+6XGS67XzzO8FH+iz/Dl/q/8gx/2S/UM/y/wP6f4T8QAAB3Bx3jhPJqfQAAAABJRU5ErkJggg==\" rel=\"icon\" type=\"image/x-icon\" />\n"
+    ICON_LINKS_HTML
     "  <title>" PROGNAME " v" VERSION "</title>\n"
     " </head>\n"
     " <body>\n"
